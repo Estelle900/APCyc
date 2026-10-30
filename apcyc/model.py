@@ -18,7 +18,7 @@ def _strip_prefix(state_dict, prefix):
 
 
 def _load_autoencoder(ckpt_path: str, strict: bool) -> AutoEncoder:
-    ckpt = torch.load(ckpt_path, map_location='cpu')
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     if isinstance(ckpt, AutoEncoder):
         return ckpt
     if isinstance(ckpt, dict):
@@ -396,6 +396,42 @@ class APCycLDMPepDesign(nn.Module):
         if isinstance(guidance_w, str):
             guidance_w = [float(x) for x in guidance_w.split(',') if x.strip() != '']
 
+        # Keep only the diffusion options not already handled above.
+        diffusion_keys = {
+            "pbar",
+            "energy_func",
+            "energy_lambda",
+        }
+
+        # These options belong to the outer sampling runner.
+        runner_keys = {
+            "strict_ckpt_check",
+            "num_samples",
+            "sample_seed",
+            "enable_length_override",
+            "pep_len",
+            "pep_len_min",
+            "pep_len_max",
+            "auto_min_pep_len",
+            "auto_min_pep_len_threshold",
+            "pdb_root",
+            "rec_chain",
+            "lig_chain",
+            "group_by_receptor",
+            "receptor_id_mode",
+        }
+
+        unknown_keys = set(sample_opt) - diffusion_keys - runner_keys
+        if unknown_keys:
+            raise ValueError(
+                f"Unknown APCyc sampling options: {sorted(unknown_keys)}"
+            )
+
+        diffusion_opt = {
+            k: v for k, v in sample_opt.items()
+            if k in diffusion_keys
+        }
+        
         traj, pair_state = self.diffusion.sample(
             H_0, X, position_embedding, mask, lengths, atom_embeddings, atom_mask, S,
             position_ids=position_ids, L=L,
@@ -414,7 +450,7 @@ class APCycLDMPepDesign(nn.Module):
             guidance_grad_norm_balance=guidance_grad_norm_balance,
             guidance_grad_norm_eps=guidance_grad_norm_eps,
             guidance_grad_norm_ref=guidance_grad_norm_ref,
-            **sample_opt,
+            **diffusion_opt,
         )
         X_0, H_0 = traj[0]
         X_0, H_0 = X_0[mask][:, : self.autoencoder.latent_n_channel], H_0[mask]

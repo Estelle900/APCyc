@@ -89,7 +89,7 @@ def generate_wrapper(model, sample_opt={}):
         def wrapper(batch):
             X, S, ppls = model.test(batch['X'], batch['S'], batch['mask'], batch['position_ids'], batch['lengths'], batch['atom_mask'])
             return X, S, ppls
-    elif isinstance(model, models.LDMPepDesign):
+    elif isinstance(model, models.APCycLDMPepDesign):
         def wrapper(batch):
             X, S, ppls = model.sample(batch['X'], batch['S'], batch['mask'], batch['position_ids'], batch['lengths'], batch['atom_mask'],
                                       L=batch['L'] if 'L' in batch else None, sample_opt=sample_opt)
@@ -152,7 +152,7 @@ def main(args, opt_args):
     b_ckpt = args.ckpt if args.ckpt.endswith('.ckpt') else get_best_ckpt(args.ckpt)
     ckpt_dir = os.path.split(os.path.split(b_ckpt)[0])[0]
     print(f'Using checkpoint {b_ckpt}')
-    model = torch.load(b_ckpt, map_location='cpu')
+    model = torch.load(b_ckpt, map_location='cpu', weights_only=False)
     device = torch.device('cpu' if args.gpu == -1 else f'cuda:{args.gpu}')
     model.to(device)
     model.eval()
@@ -187,7 +187,25 @@ def main(args, opt_args):
         with torch.no_grad():
             for batch in test_loader:
                 batch = to_device(batch, device)
-                batch_X, batch_S, batch_pmetric = generate_wrapper(model, deepcopy(config.get('sample_opt', {})))(batch)
+
+                # APCyc diffusion expects a 1D tensor of complex lengths.
+                lengths = torch.as_tensor(
+                    batch['lengths'],
+                    dtype=torch.long,
+                    device=device,
+                ).reshape(-1)
+
+                if lengths.sum().item() != batch['mask'].numel():
+                    raise ValueError(
+                        f"Invalid batch lengths: {lengths.tolist()}, "
+                        f"mask elements: {batch['mask'].numel()}"
+                    )
+
+                batch['lengths'] = lengths
+
+                batch_X, batch_S, batch_pmetric = generate_wrapper(
+                    model, deepcopy(config.get('sample_opt', {}))
+                )(batch)
 
                 # parallel
                 inputs = []

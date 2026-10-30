@@ -89,7 +89,7 @@ def load_ckpt(model, ckpt):
         ckpt_path = ckpt.get('path')
         strict = ckpt.get('strict', True)
         skip_mismatch = ckpt.get('skip_mismatch', not strict)
-    trained_model = torch.load(ckpt_path, map_location='cpu')
+    trained_model = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state_dict = _extract_state_dict(model, trained_model)
     if skip_mismatch:
         filtered, missing, unexpected, mismatched = _filter_state_dict_by_shape(model, state_dict)

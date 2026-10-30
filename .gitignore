@@ -80,6 +80,8 @@ eval_outputs/
 wandb/
 tensorboard/
 *_results*/
+CPCore/
+*.pdb
 
 # Large generated scientific artifacts
 *.pt

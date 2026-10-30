@@ -24,7 +24,7 @@ dataloader:
   wrapper:
     class: DynamicBatchWrapper
     complexity: n**2
-    ubound_per_batch: 60000
+    ubound_per_batch: 20000
     type_balanced: false
     type_target:
       ISO: 0.0
@@ -38,9 +38,9 @@ trainer:
   config:
     max_epoch: 1000
     save_topk: 5
-    val_freq: 10
+    val_freq: 5
     save_dir: ./ckpts/APCyc
-    patience: 10
+    patience: 5
     metric_min_better: true
     optimizer:
       class: AdamW
@@ -55,7 +55,7 @@ trainer:
 
 model:
   class: APCycLDMPepDesign
-  autoencoder_ckpt: ckpts/APCyc_AE/version_5/checkpoint/epoch94_step222585.ckpt
+  autoencoder_ckpt: ckpts/APCyc_AE/version_0/checkpoint/epoch93_step220000.ckpt
   autoencoder_no_randomness: false
   hidden_size: 128
   num_steps: 100
@@ -134,6 +134,6 @@ rec_chain: R
 lig_chain: L
 
 load_ckpt:
-  path: PepGlad_CPSea.ckpt
+  path: pepglad_weights/PepGlad_CPSea.ckpt
   strict: false
   skip_mismatch: true

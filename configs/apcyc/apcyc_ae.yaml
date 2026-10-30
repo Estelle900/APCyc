@@ -16,7 +16,7 @@ dataset:
     return_supervision: false
     return_sample_id: false
     
-load_ckpt: PepGlad_CPSea.ckpt
+load_ckpt: pepglad_weights/PepGlad_CPSea.ckpt
 
 dataloader:
   batch_size: 1

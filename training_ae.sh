@@ -1,0 +1,1 @@
+GPU=0 bash scripts/train.sh configs/apcyc/apcyc_ae.yaml

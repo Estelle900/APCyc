@@ -1,0 +1,3 @@
+[submodule "CPSea"]
+	path = CPSea
+	url = https://github.com/YZY010418/CPSea.git

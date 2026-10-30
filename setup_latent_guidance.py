@@ -16,7 +16,23 @@ def main(args):
     # load model
     b_ckpt = args.ckpt if args.ckpt.endswith('.ckpt') else get_best_ckpt(args.ckpt)
     print(f'Using checkpoint {b_ckpt}')
-    model = torch.load(b_ckpt, map_location='cpu')
+    model = torch.load(b_ckpt, map_location='cpu', weights_only=False)
+
+    # Reuse previously computed latent-distance statistics.
+    if (
+        getattr(model, "consec_dist_mean", None) is not None
+        and getattr(model, "consec_dist_std", None) is not None
+        and not args.force
+    ):
+        print(
+            "Using cached latent guidance: "
+            f"mean={model.consec_dist_mean:.6f}, "
+            f"std={model.consec_dist_std:.6f}"
+        )
+        return
+
+    print("Latent guidance cache missing; scanning dataset...")
+
     device = torch.device('cpu' if args.gpu == -1 else f'cuda:{args.gpu}')
     model.to(device)
     model.eval()
@@ -60,6 +76,7 @@ def parse():
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--ckpt', type=str, required=True)
     parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument("--force", action="store_true", help="Recompute latent guidance statistics")
     return parser.parse_args()
 
 

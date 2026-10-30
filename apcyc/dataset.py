@@ -132,6 +132,14 @@ class CPCoreDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.sample_ids)
 
+    def get_summary(self, idx: int):
+        sample_id = self.sample_ids[idx]
+        ref_pdb = os.path.join(
+            self.pdb_root,
+            sample_id + ".pdb"
+        )
+        return sample_id, ref_pdb, self.rec_chain, self.lig_chain
+
     def get_len(self, idx: int):
         return self._lengths[idx]
 

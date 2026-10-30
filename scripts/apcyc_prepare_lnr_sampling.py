@@ -26,7 +26,7 @@ def _list_receptor_ids(rec_dir: str) -> List[str]:
     for fname in os.listdir(rec_dir):
         if not fname.endswith("_receptor.pdb"):
             continue
-        ids.append(fname.replace("_receptor.pdb", ""))
+        ids.append(fname.replace("_receptor.pdb", "").replace("._", ""))
     return sorted(set(ids))
 
 

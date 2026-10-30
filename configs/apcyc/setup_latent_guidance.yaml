@@ -1,0 +1,14 @@
+dataset:
+  test:
+    class: CPCoreMMapDataset
+    mmap_dir: CPCore/cpcore_mmap
+    specify_index: CPCore/cpcore_mmap/train_index.txt
+    jsonl_path: cpcore_train.jsonl
+    backbone_only: false
+    return_supervision: false
+    return_sample_id: false
+
+dataloader:
+  batch_size: 1
+  shuffle: false
+  num_workers: 4

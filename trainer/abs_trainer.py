@@ -79,6 +79,7 @@ class Trainer:
         self.valid_global_step = 0
         self.epoch = 0
         self.last_valid_metric = None
+        self.best_valid_metric = None
         self.topk_ckpt_map = []  # smaller index means better ckpt
         self.patience = self.config.patience
 
@@ -213,6 +214,7 @@ class Trainer:
             print_log(f'Validation: {valid_metric}, save path: {save_path}')
         if update_state:
             if self._metric_better(valid_metric):
+                self.best_valid_metric = valid_metric
                 self.patience = self.config.patience
             else:
                 self.patience -= 1
@@ -233,7 +235,7 @@ class Trainer:
         return
 
     def _metric_better(self, new):
-        old = self.last_valid_metric
+        old = self.best_valid_metric
         if old is None:
             return True
         if self.config.metric_min_better:
