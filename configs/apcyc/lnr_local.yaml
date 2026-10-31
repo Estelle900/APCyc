@@ -97,7 +97,7 @@ model:
       SS: 5.5
       ISO: 5.0
 
-n_samples: 10
+n_samples: 100
 
 sample_opt:
   pbar: false
@@ -106,7 +106,6 @@ sample_opt:
   energy_lambda: 0.8
   autoencoder_n_iter: 1
   t_hard: 10
-  num_samples: 10
   enable_length_override: false
   pep_len: null
   pep_len_min: null

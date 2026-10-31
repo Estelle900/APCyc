@@ -91,5 +91,9 @@ fi
 ########## cal metrics ##########
 if [ "$EVAL_FLAG" = "1" ]; then
     echo "Evaluation:" >> $OUTLOG
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
     python cal_metrics.py --results ${LDM_SAVE_DIR}/version_0/results/results.jsonl >> $OUTLOG
 fi

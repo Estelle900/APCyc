@@ -82,6 +82,8 @@ tensorboard/
 *_results*/
 CPCore/
 *.pdb
+cpcore_train.jsonl
+CPSea/
 
 # Large generated scientific artifacts
 *.pt
@@ -98,7 +100,6 @@ CPCore/
 *.zip
 
 # Optional third-party tools downloaded locally
-DockQ/
 TMscore/
 FoldX/
 pyrosetta*/

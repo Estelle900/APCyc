@@ -1,3 +1,7 @@
 [submodule "CPSea"]
 	path = CPSea
 	url = https://github.com/YZY010418/CPSea.git
+[submodule "evaluation/DockQ"]
+	path = evaluation/DockQ
+	url = https://github.com/Estelle900/DockQ.git
+	branch = optimized-v1

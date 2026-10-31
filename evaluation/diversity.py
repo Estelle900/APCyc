@@ -6,71 +6,145 @@ import numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 from scipy.stats.contingency import association
+from scipy.spatial.distance import pdist
 
 from evaluation.seq_metric import align_sequences
 
 
-def seq_diversity(seqs: List[str], th: float=0.4) -> float:
-    '''
-        th: sequence distance 
-    '''
-    if len(seqs) <= 1:
-        if not seqs:
-            return 0.0, np.array([], dtype=int)
+def seq_diversity(seqs: List[str], th: float = 0.4):
+    n = len(seqs)
+
+    if n == 0:
+        return 0.0, np.array([], dtype=int)
+
+    if n == 1:
         return 1.0, np.array([1], dtype=int)
-    dists = []
-    for i, seq1 in enumerate(seqs):
-        dists.append([])
-        for j, seq2 in enumerate(seqs):
-            _, sim = align_sequences(seq1, seq2)
-            dists[i].append(1 - sim)
-    dists = np.array(dists)
-    Z = linkage(squareform(dists), 'single')
-    cluster = fcluster(Z, t=th, criterion='distance')
-    return len(np.unique(cluster)) / len(seqs), cluster
+
+    # Condensed distance matrix
+    dists = np.empty(n * (n - 1) // 2, dtype=np.float64)
+
+    k = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            if seqs[i] == seqs[j]:
+                dist = 0.0
+            else:
+                _, sim = align_sequences(seqs[i], seqs[j])
+                dist = 1.0 - sim
+
+            dists[k] = dist
+            k += 1
+
+    if not np.isfinite(dists).all():
+        raise ValueError("Invalid sequence distances")
+
+    Z = linkage(dists, method="single")
+    clusters = fcluster(Z, t=th, criterion="distance")
+
+    diversity = len(np.unique(clusters)) / n
+
+    return diversity, clusters
 
 
 def struct_diversity(structs: np.ndarray, th: float=4.0) -> float:
     '''
+    Cluster structures using CA-coordinate RMSD.
+
+    Invalid structures are excluded from clustering.
+    Their cluster labels are set to -1.
+
     structs: N*L*3, alpha carbon coordinates
     th: threshold for clustering (distance < th)
     '''
-    if structs.shape[0] <= 1:
-        if structs.shape[0] == 0:
-            return 0.0, np.array([], dtype=int)
-        return 1.0, np.array([1], dtype=int)
-    ca_dists = np.sum((structs[:, None] - structs[None, :]) ** 2, axis=-1) # [N, N, L]
-    rmsd = np.sqrt(np.mean(ca_dists, axis=-1))
-    Z = linkage(squareform(rmsd), 'single') # since the distances might not be euclidean distances (e.g. rmsd)
-    cluster = fcluster(Z, t=th, criterion='distance')
-    return len(np.unique(cluster)) / structs.shape[0], cluster
+    structs = np.asarray(structs, dtype=np.float64)
+
+    if structs.ndim != 3 or structs.shape[-1] != 3:
+        raise ValueError("structs must have shape (N, L, 3)")
+
+    n, L, _ = structs.shape
+    clusters = np.full(n, -1, dtype=int)
+
+    if n == 0:
+        return 0.0, clusters
+
+    if L == 0:
+        return float("nan"), clusters
+
+    # Filter structures containing NaN or Inf
+    valid = np.isfinite(structs).all(axis=(1, 2))
+    n_valid = int(valid.sum())
+
+    if n_valid == 0:
+        return float("nan"), clusters
+
+    if n_valid == 1:
+        clusters[valid] = 1
+        return 1.0, clusters
+
+    # Pairwise RMSD, without structural alignment
+    valid_structs = structs[valid]
+    coords = valid_structs.reshape(n_valid, -1)
+
+    rmsd = pdist(coords, metric="euclidean") / np.sqrt(L)
+
+    # Catch numerical overflow
+    if not np.isfinite(rmsd).all():
+        return float("nan"), clusters
+
+    Z = linkage(rmsd, method="single")
+    valid_clusters = fcluster(
+        Z, t=th, criterion="distance"
+    )
+
+    clusters[valid] = valid_clusters
+
+    return len(np.unique(valid_clusters)) / n_valid, clusters
 
 
 def diversity(seqs: List[str], structs: np.ndarray):
     seq_div, seq_clu = seq_diversity(seqs)
+
     if structs is None:
         return seq_div, None, seq_div, None
+
+    if len(seqs) != len(structs):
+        raise ValueError(
+            "seqs and structs must have the same number of candidates"
+        )
+
     struct_div, struct_clu = struct_diversity(structs)
+
+    # Only use valid structures for consistency
+    valid = struct_clu > 0
+
+    if not valid.any():
+        return seq_div, struct_div, float("nan"), float("nan")
+
     co_div = np.sqrt(seq_div * struct_div)
 
-    n_seq_clu, n_struct_clu = np.max(seq_clu), np.max(struct_clu) # clusters start from 1
+    seq_labels = seq_clu[valid]
+    struct_labels = struct_clu[valid]
+
+    # Remap cluster labels to contiguous indices
+    _, seq_idx = np.unique(seq_labels, return_inverse=True)
+    _, struct_idx = np.unique(struct_labels, return_inverse=True)
+
+    n_seq_clu = len(np.unique(seq_idx))
+    n_struct_clu = len(np.unique(struct_idx))
+
     if n_seq_clu == 1 or n_struct_clu == 1:
-        consistency = 1.0 if n_seq_clu == n_struct_clu else 0.0
+        consistency = (
+            1.0 if n_seq_clu == n_struct_clu else 0.0
+        )
     else:
-        table = [[0 for _ in range(n_struct_clu)] for _ in range(n_seq_clu)]
-        for seq_c, struct_c in zip(seq_clu, struct_clu):
-            table[seq_c - 1][struct_c - 1] += 1
-        consistency = association(np.array(table), method='cramer')
+        table = np.zeros(
+            (n_seq_clu, n_struct_clu), dtype=int
+        )
+
+        np.add.at(table, (seq_idx, struct_idx), 1)
+
+        consistency = association(
+            table, method="cramer"
+        )
 
     return seq_div, struct_div, co_div, consistency
-
-
-if __name__ == '__main__':
-    N, L = 100, 10
-    a = np.random.randn(N, L, 3)
-    print(struct_diversity(a))
-    from utils.const import aas
-    aas = [tup[0] for tup in aas]
-    seqs = np.random.randint(0, len(aas), (N, L))
-    seqs = [''.join([aas[i] for i in idx]) for idx in seqs]
-    print(seq_diversity(seqs, 0.4))
