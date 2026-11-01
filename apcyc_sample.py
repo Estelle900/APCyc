@@ -20,6 +20,7 @@ from data.converter.list_blocks_to_pdb import list_blocks_to_pdb
 from data.format import VOCAB, Atom, Block
 from utils.const import sidechain_atoms
 from apcyc.constants import IDX2TYPE
+from apcyc.smc import smc_output_dir, smc_budget_options, smc_slice_outputs
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -231,7 +232,9 @@ def main(args, opt_args):
         del ref_model
     model.to(device)
     model.eval()
-
+    
+    generation_out_dir = smc_output_dir(
+        args.out_dir, sample_opt, model_is_apcyc=isinstance(model, models.APCycLDMPepDesign))
     dataset, _, _ = create_dataset(config['dataset'])
     loader = create_dataloader(dataset, config['dataloader'], n_gpu=1, validation=True)
 
@@ -270,6 +273,10 @@ def main(args, opt_args):
                 return dict(sample_opt_dict)
             allowed = set(sig.parameters.keys())
             filtered = {k: v for k, v in sample_opt_dict.items() if k in allowed}
+            if 'smc' in sample_opt_dict:
+                for key in ('smc', 'property_ckpt', 'property_ckpts', 'guidance_w', 'guidance_w_map'):
+                    if key in sample_opt_dict:
+                        filtered[key] = sample_opt_dict[key]
             dropped = sorted(set(sample_opt_dict.keys()) - set(filtered.keys()))
             if dropped:
                 print_log(f'Sampling: dropped unsupported sample_opt keys: {dropped}')
@@ -277,6 +284,11 @@ def main(args, opt_args):
         return dict(sample_opt_dict)
 
     filtered_sample_opt = _filter_sample_opt(model, sample_opt)
+    
+    smc_sample_opt = smc_budget_options(
+        filtered_sample_opt, num_samples,
+        model_is_apcyc=isinstance(model, models.APCycLDMPepDesign))
+    smc_budget = smc_sample_opt is not None
 
     with open(results_path, 'w') as f:
         pbar = None
@@ -323,25 +335,47 @@ def main(args, opt_args):
                         mask_i = mask_i.detach().cpu()
                     pep_indices_current = torch.nonzero(mask_i, as_tuple=False).view(-1).tolist() if mask_i is not None else []
                     pep_len_current = len(pep_indices_current)
-                    for k in range(num_samples):
-                        if base_seed is not None:
-                            torch.manual_seed(int(base_seed) + k)
+                    if smc_budget:
+                        # All particles have the same length in a single SMC run.
+                        # A random range would require independent groups instead.
+                        if enable_length_override and target_pep_len is None and int(pep_len_min) != int(pep_len_max):
+                            raise ValueError('SMC budget mode requires a fixed pep_len or pep_len_min == pep_len_max')
+                        new_len = pep_len_current
                         if enable_length_override:
-                            if target_pep_len is not None:
-                                new_len = int(target_pep_len)
-                            else:
-                                new_len = int(torch.randint(int(pep_len_min), int(pep_len_max) + 1, (1,)).item())
-                        else:
-                            new_len = pep_len_current
-                            if auto_min_pep_len is not None and pep_len_current < auto_min_threshold:
-                                new_len = auto_min_pep_len
+                            new_len = int(target_pep_len) if target_pep_len is not None else int(pep_len_min)
+                        elif auto_min_pep_len is not None and pep_len_current < auto_min_threshold:
+                            new_len = auto_min_pep_len
                         if new_len != pep_len_current:
                             single = _rebuild_batch_with_pep_len(single, new_len)
-                        X, S, ppls, pair_out = _sample_with_pair(
+                        if base_seed is not None:
+                            torch.manual_seed(int(base_seed))
+                        smc_all = _sample_with_pair(
                             model,
                             single['X'], single['S'], single['mask'], single['position_ids'], single['lengths'], single['atom_mask'],
-                            L=single.get('L', None), sample_opt=dict(filtered_sample_opt),
+                            L=single.get('L', None), sample_opt=dict(smc_sample_opt),
                         )
+                    for k in range(num_samples):
+                        if smc_budget:
+                            X, S, ppls, pair_out = smc_slice_outputs(smc_all, 1, num_samples, k)
+                        else:
+                            if base_seed is not None:
+                                torch.manual_seed(int(base_seed) + k)
+                            if enable_length_override:
+                                if target_pep_len is not None:
+                                    new_len = int(target_pep_len)
+                                else:
+                                    new_len = int(torch.randint(int(pep_len_min), int(pep_len_max) + 1, (1,)).item())
+                            else:
+                                new_len = pep_len_current
+                                if auto_min_pep_len is not None and pep_len_current < auto_min_threshold:
+                                    new_len = auto_min_pep_len
+                            if new_len != pep_len_current:
+                                single = _rebuild_batch_with_pep_len(single, new_len)
+                            X, S, ppls, pair_out = _sample_with_pair(
+                                model,
+                                single['X'], single['S'], single['mask'], single['position_ids'], single['lengths'], single['atom_mask'],
+                                L=single.get('L', None), sample_opt=dict(filtered_sample_opt),
+                            )
                         for j, sample_id in enumerate(single['sample_id']):
                             mask_i = single['mask']
                             if torch.is_tensor(mask_i) and mask_i.dim() > 1:
@@ -416,14 +450,27 @@ def main(args, opt_args):
                     pbar.update(batch_size)
                 continue
 
-            for k in range(num_samples):
+            if smc_budget:
                 if base_seed is not None:
-                    torch.manual_seed(int(base_seed) + k)
-                X, S, ppls, pair_out = _sample_with_pair(
+                    torch.manual_seed(int(base_seed))
+                smc_all = _sample_with_pair(
                     model,
                     batch['X'], batch['S'], batch['mask'], batch['position_ids'], batch['lengths'], batch['atom_mask'],
-                    L=batch.get('L', None), sample_opt=dict(filtered_sample_opt),
+                    L=batch.get('L', None), sample_opt=dict(smc_sample_opt),
                 )
+
+            for k in range(num_samples):
+                if smc_budget:
+                    X, S, ppls, pair_out = smc_slice_outputs(smc_all, batch_size, num_samples, k)
+                else:
+                    if base_seed is not None:
+                        torch.manual_seed(int(base_seed) + k)
+                    X, S, ppls, pair_out = _sample_with_pair(
+                        model,
+                        batch['X'], batch['S'], batch['mask'], batch['position_ids'], batch['lengths'], batch['atom_mask'],
+                        L=batch.get('L', None), sample_opt=dict(filtered_sample_opt),
+                    )
+                    
                 for i, sample_id in enumerate(batch['sample_id']):
                     mask_i = batch['mask']
                     if torch.is_tensor(mask_i) and mask_i.dim() > 1:

@@ -83,7 +83,6 @@ tensorboard/
 CPCore/
 *.pdb
 cpcore_train.jsonl
-CPSea/
 
 # Large generated scientific artifacts
 *.pt

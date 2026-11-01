@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 
 import models
+from apcyc.smc import smc_output_dir
 from utils.config_utils import overwrite_values
 from data.converter.pdb_to_list_blocks import pdb_to_list_blocks
 from data.converter.list_blocks_to_pdb import list_blocks_to_pdb
@@ -21,6 +22,7 @@ from data import create_dataloader, create_dataset
 from utils.logger import print_log
 from utils.random_seed import setup_seed
 from utils.const import sidechain_atoms
+from apcyc.smc import smc_budget_options
 
 
 def get_best_ckpt(ckpt_dir):
@@ -166,6 +168,7 @@ def main(args, opt_args):
         save_dir = os.path.join(ckpt_dir, 'results')
     else:
         save_dir = args.save_dir
+    save_dir = smc_output_dir(save_dir, config.get('sample_opt', {}), model_is_apcyc=isinstance(model, models.APCycLDMPepDesign))
     ref_save_dir = os.path.join(save_dir, 'references')
     cand_save_dir = os.path.join(save_dir, 'candidates')
     for directory in [ref_save_dir, cand_save_dir]:
@@ -179,10 +182,16 @@ def main(args, opt_args):
     # multiprocessing
     pool = Pool(args.n_cpu)
 
-    n_samples = config.get('n_samples', 1)
-
-    pbar = tqdm(total=n_samples * len(test_loader))
-    for n in range(n_samples):
+    n_samples = int(config.get('n_samples', 1))
+    if n_samples < 1:
+        raise ValueError('n_samples must be >= 1')
+    
+    smc_sample_opt = smc_budget_options(
+        config.get('sample_opt', {}), n_samples,
+        model_is_apcyc=isinstance(model, models.APCycLDMPepDesign))
+    smc_budget = smc_sample_opt is not None
+    pbar = tqdm(total=(len(test_loader) if smc_budget else n_samples * len(test_loader)))
+    for n in range(1 if smc_budget else n_samples):
         item_idx = 0
         with torch.no_grad():
             for batch in test_loader:
@@ -204,28 +213,34 @@ def main(args, opt_args):
                 batch['lengths'] = lengths
 
                 batch_X, batch_S, batch_pmetric = generate_wrapper(
-                    model, deepcopy(config.get('sample_opt', {}))
+                    model, deepcopy(smc_sample_opt if smc_budget else config.get('sample_opt', {}))
                 )(batch)
 
                 # parallel
                 inputs = []
-                for X, S, pmetric in zip(batch_X, batch_S, batch_pmetric):
-                    _id, ref_pdb, rec_chain, lig_chain = test_set.get_summary(item_idx)
+                if smc_budget and len(batch_X) != len(lengths) * n_samples:
+                    raise ValueError('SMC must return exactly n_samples outputs per complex')
+                
+                for output_index, (X, S, pmetric) in enumerate(zip(batch_X, batch_S, batch_pmetric)):
+                    # Samples are grouped by complex, with n_samples particles each.
+                    output_n = output_index % n_samples if smc_budget else n
+                    summary_index = item_idx + (output_index // n_samples if smc_budget else output_index)
+                    _id, ref_pdb, rec_chain, lig_chain = test_set.get_summary(summary_index)
                     # save temporary pickle file
-                    x_pkl_file = os.path.join(save_dir, _id + f'_gen_{n}_X.pkl')
+                    x_pkl_file = os.path.join(save_dir, _id + f'_gen_{output_n}_X.pkl')
                     pkl.dump(X, open(x_pkl_file, 'wb'))
-                    s_pkl_file = os.path.join(save_dir, _id + f'_gen_{n}_S.pkl')
+                    s_pkl_file = os.path.join(save_dir, _id + f'_gen_{output_n}_S.pkl')
                     pkl.dump(S, open(s_pkl_file, 'wb'))
-                    pmetric_pkl_file = os.path.join(save_dir, _id + f'_gen_{n}_pmetric.pkl')
+                    pmetric_pkl_file = os.path.join(save_dir, _id + f'_gen_{output_n}_pmetric.pkl')
                     pkl.dump(pmetric, open(pmetric_pkl_file, 'wb'))
                     inputs.append((
-                        _id, n,
+                        _id, output_n,
                         x_pkl_file, s_pkl_file, pmetric_pkl_file,
                         ref_pdb, rec_chain, lig_chain, ref_save_dir, cand_save_dir,
                         seq_only, struct_only, backbone_only
                     ))
-                    item_idx += 1
                 
+                item_idx += (len(batch_X) // n_samples if smc_budget else len(batch_X))                
                 results = pool.starmap(save_data, inputs)
                 for result in results:
                     fout.write(json.dumps(result) + '\n')

@@ -108,13 +108,13 @@ python -m scripts.data_process.split \
 
 ## APCyc Configs
 
-Core APCyc configs:
+Validated core APCyc configs:
 
 ```text
 configs/apcyc/apcyc_ae.yaml
 configs/apcyc/apcyc_ldm.yaml
-configs/apcyc/apcyc_ldm_sample.yaml
-configs/apcyc/property/*.yaml
+configs/apcyc/setup_latent_guidance.yaml
+configs/apcyc/lnr_local.yaml
 ```
 
 Router configs:

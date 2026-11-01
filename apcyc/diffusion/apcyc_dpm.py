@@ -392,6 +392,8 @@ class APCycFullDPM(nn.Module):
             H_noisy, X_noisy_unorm, S, mask_generate, batch_ids, position_ids, type_labels
         )
 
+        if smc_state is not None:
+            smc_state.repair_pair_probabilities(t, pair_out)
         p_c = torch.softmax(pair_out['type_logits'], dim=-1)
         lambda_cyc = cyclic_lambda(t, self.num_steps, self.lambda_cyc_max, self.lambda_cyc_schedule)
         lambda_b = cyclic_lambda(t, self.num_steps, self.lambda_b_max, self.lambda_cyc_schedule)
@@ -510,6 +512,10 @@ class APCycFullDPM(nn.Module):
         lambda_max: float = 0.0,
         t_guidance_start: int = 0,
         t_guidance_end: int = 0,
+        smc_state=None,
+        smc_initial_state=None,
+        smc_start_t=None,
+        smc_stop_t=1,
     ):
         batch_ids = self._get_batch_ids(mask_generate, lengths)
         X, centers = self._normalize_position(X, batch_ids, mask_generate, atom_mask, L)
@@ -526,7 +532,22 @@ class APCycFullDPM(nn.Module):
         else:
             H_init = H
 
-        traj = {self.num_steps: (X_init, H_init)}
+        # resume from normalized latents for a short time window without changing physical receptor/context coordinates.
+        smc_first_t = self.num_steps if smc_start_t is None else int(smc_start_t)
+        smc_last_t = int(smc_stop_t)
+
+        if not 1 <= smc_last_t <= smc_first_t <= self.num_steps:
+            raise ValueError('Invalid global SMC diffusion window')
+        if smc_initial_state is not None:
+            X_init, H_init = smc_initial_state
+            if X_init.shape != X.shape or H_init.shape != H.shape:
+                raise ValueError('Global SMC initial latent shape mismatch')
+            if X_init.device != X.device or H_init.device != H.device:
+                raise ValueError('Global SMC initial latents must use sampler device')
+        elif smc_start_t is not None and smc_first_t != self.num_steps:
+            raise ValueError('Global SMC continuation requires previous latent state')
+        
+        traj = {smc_first_t: (X_init, H_init)}
         pair_traj = []
         hard_pairs = None
 
@@ -542,7 +563,7 @@ class APCycFullDPM(nn.Module):
         else:
             pbar = lambda x: x
 
-        for t in pbar(range(self.num_steps, 0, -1)):
+        for t in pbar(range(smc_first_t, smc_last_t - 1, -1)):
             X_t, H_t = traj[t]
             X_t, H_t = torch.round(X_t, decimals=4), torch.round(H_t, decimals=4)
 
@@ -627,6 +648,19 @@ class APCycFullDPM(nn.Module):
                 H_t, X_t, position_embedding, ctx_edges, inter_edges, atom_embeddings, atom_mask.float(), mask_generate, beta,
                 ctx_edge_attr=ctx_edge_attr, inter_edge_attr=inter_edge_attr,
                 edge_bias=edge_bias, edge_gate=edge_gate)
+            
+            if smc_state is not None and smc_state.should_score(t):
+                smc_state.observe(
+                    t, pair_out=pair_out, predictor=property_predictor,
+                    X_unorm=X_t_unorm,
+                    H_t=H_t, X_t=X_t, mask_generate=mask_generate,
+                    atom_mask=atom_mask, position_ids=position_ids,
+                    ctx_edges=ctx_edges, inter_edges=inter_edges,
+                    ctx_edge_attr=ctx_edge_attr, inter_edge_attr=inter_edge_attr,
+                    edge_gate=edge_gate, edge_bias=edge_bias,
+                    edge_type_ids=edge_type_ids, p_c=p_c, t_batch=t_batch,
+                    batch_ids=batch_ids, atom_embeddings=atom_embeddings)
+
             if energy_func is not None:
                 with torch.enable_grad():
                     cur_X_state = X_t.clone().double()
@@ -795,9 +829,16 @@ class APCycFullDPM(nn.Module):
                 X_next = X_t
             if not sample_sequence:
                 H_next = H_t
+            if smc_state is not None:
+                X_next, H_next = smc_state.resample_step(t, X_next, H_next)
 
             traj[t - 1] = (X_next, H_next)
-            traj[t] = (self._unnormalize_position(traj[t][0], centers, batch_ids, L).cpu(), traj[t][1].cpu())
+            if smc_start_t is None:
+                # trajectory behavior for baseline runs.
+                traj[t] = (self._unnormalize_position(traj[t][0], centers, batch_ids, L).cpu(), traj[t][1].cpu())
+            else:
+                # The global runner keeps just the current normalized state, avoiding a CPU/GPU trajectory history for every particle.
+                del traj[t]
 
             if return_pair_trajectory:
                 pair_traj.append({
@@ -806,7 +847,10 @@ class APCycFullDPM(nn.Module):
                     's_ij_full': pair_out['s_ij_full'].detach().cpu(),
                 })
 
+        if smc_start_t is not None and smc_last_t > 1:
+            return {smc_last_t - 1: traj[smc_last_t - 1]}, None
         traj[0] = (self._unnormalize_position(traj[0][0], centers, batch_ids, L), traj[0][1])
+        
         pair_state = {
             'type_logits': pair_out['type_logits'],
             's_ij_full': pair_out['s_ij_full'],

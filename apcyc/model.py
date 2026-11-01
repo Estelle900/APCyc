@@ -11,6 +11,9 @@ from utils.oom_decorator import oom_decorator
 from data.format import VOCAB
 
 from models.autoencoder.model import AutoEncoder
+from apcyc.smc import select_samples, SMCController, expand_graph_batch
+from apcyc.diffusion.apcyc_dpm import APCycFullDPM
+from apcyc.constants import CYCLE_TYPES, TYPE2IDX
 
 
 def _strip_prefix(state_dict, prefix):
@@ -32,8 +35,6 @@ def _load_autoencoder(ckpt_path: str, strict: bool) -> AutoEncoder:
         autoencoder.load_state_dict(state_dict, strict=strict)
         return autoencoder
     raise TypeError(f'Unsupported autoencoder checkpoint type: {type(ckpt)}')
-from apcyc.diffusion.apcyc_dpm import APCycFullDPM
-from apcyc.constants import CYCLE_TYPES, TYPE2IDX
 
 
 @R.register('APCycLDMPepDesign')
@@ -308,6 +309,39 @@ class APCycLDMPepDesign(nn.Module):
         return_pair: bool = False,
         **kwargs,
     ):
+        sample_opt = dict(sample_opt)
+        global_smc = sample_opt.get('smc')
+        if (isinstance(global_smc, dict) and global_smc.get('enabled', True)
+                and not global_smc.get('legacy_batch', False)):
+            from apcyc.smc_global import sample_population
+            return sample_population(
+                self, X, S, mask, position_ids, lengths, atom_mask, L, sample_opt,
+                return_pair=return_pair, return_tensor=return_tensor,
+                optimize_sidechain=optimize_sidechain)
+        
+        # Private continuation interface; only smc_global uses this.
+        _smc_segment = sample_opt.pop('_smc_segment', None)
+        smc_opt = sample_opt.pop('smc', None)
+        if smc_opt is True:
+            smc_opt = {'enabled': True}
+        elif smc_opt is False or smc_opt is None:
+            smc_opt = {'enabled': False}
+        elif not isinstance(smc_opt, dict):
+            raise TypeError('sample_opt.smc must be a boolean or mapping')
+        smc_state = None
+        if smc_opt.get('enabled', True):
+            smc_particles = int(smc_opt.get('particles', 4))
+            if smc_particles < 1:
+                raise ValueError('smc.particles must be >= 1')
+            if smc_particles > 1:
+                (X, S, mask, position_ids, lengths, atom_mask, L,
+                 original_lengths) = expand_graph_batch(
+                    X, S, mask, position_ids, lengths, atom_mask, L, smc_particles)
+                smc_scoring_opt = dict(smc_opt)
+                smc_scoring_opt.setdefault('dist_mean', getattr(self, 'consec_dist_mean', None))
+                smc_scoring_opt.setdefault('dist_std', getattr(self, 'consec_dist_std', None))
+                smc_state = SMCController(
+                    original_lengths, smc_particles, self.diffusion.num_steps, smc_scoring_opt)
         self.autoencoder.eval()
         if self.train_sequence:
             S = S.clone()
@@ -376,7 +410,7 @@ class APCycLDMPepDesign(nn.Module):
             else:
                 raise TypeError(f'Unsupported property_ckpts type: {type(property_ckpts)}')
 
-        if use_cg_guidance and ckpt_paths is not None:
+        if (use_cg_guidance or (smc_state is not None and smc_state.score_mode == 'property')) and ckpt_paths is not None:
             from apcyc.guidance import load_property_predictor, load_property_predictors
             ckpt_tag = tuple(ckpt_paths)
             if self.property_predictor is None or getattr(self, '_property_predictor_tag', None) != ckpt_tag:
@@ -386,7 +420,7 @@ class APCycLDMPepDesign(nn.Module):
                     self.property_predictor = load_property_predictors(ckpt_paths, device=X.device, keys=ckpt_keys)
                 self._property_predictor_tag = ckpt_tag
 
-        if guidance_w is None and guidance_w_map is not None and use_cg_guidance:
+        if guidance_w is None and guidance_w_map is not None and (use_cg_guidance or (smc_state is not None and smc_state.score_mode == 'property')):
             keys = getattr(self.property_predictor, 'property_keys', None)
             if keys:
                 guidance_w = [guidance_w_map.get(k, 1.0) for k in keys]
@@ -395,7 +429,13 @@ class APCycLDMPepDesign(nn.Module):
 
         if isinstance(guidance_w, str):
             guidance_w = [float(x) for x in guidance_w.split(',') if x.strip() != '']
-
+        
+        if smc_state is not None and smc_state.score_mode == 'property':
+            if self.property_predictor is None:
+                raise ValueError('smc.score=property requires property_ckpt(s)')
+            if smc_state.property_weights is None:
+                smc_state.property_weights = guidance_w
+        
         # Keep only the diffusion options not already handled above.
         diffusion_keys = {
             "pbar",
@@ -450,8 +490,17 @@ class APCycLDMPepDesign(nn.Module):
             guidance_grad_norm_balance=guidance_grad_norm_balance,
             guidance_grad_norm_eps=guidance_grad_norm_eps,
             guidance_grad_norm_ref=guidance_grad_norm_ref,
+            smc_state=smc_state if _smc_segment is None else _smc_segment['observer'],
+            smc_initial_state=None if _smc_segment is None else _smc_segment['initial_state'],
+            smc_start_t=None if _smc_segment is None else _smc_segment['start_t'],
+            smc_stop_t=1 if _smc_segment is None else _smc_segment['stop_t'],
             **diffusion_opt,
         )
+
+        if _smc_segment is not None and _smc_segment['stop_t'] > 1:
+            # Normalized latents at t=stop_t-1, NOT decoded output.
+            return traj[_smc_segment['stop_t'] - 1]
+        
         X_0, H_0 = traj[0]
         X_0, H_0 = X_0[mask][:, : self.autoencoder.latent_n_channel], H_0[mask]
 
@@ -461,6 +510,11 @@ class APCycLDMPepDesign(nn.Module):
             allow_unk=False, optimize_sidechain=optimize_sidechain,
             n_iter=autoencoder_n_iter
         )
+        if smc_state is not None and not smc_state.return_all:
+            smc_selected = smc_state.final_indices()
+            batch_X = select_samples(batch_X, smc_selected)
+            batch_S = select_samples(batch_S, smc_selected)
+            batch_ppls = select_samples(batch_ppls, smc_selected)
 
         if not return_pair:
             return batch_X, batch_S, batch_ppls
@@ -480,6 +534,11 @@ class APCycLDMPepDesign(nn.Module):
             j = int(flat_idx % s_pp.size(1))
             pair_hat.append(torch.tensor([i, j], device=s_ij_full.device))
         pair_hat = torch.stack(pair_hat, dim=0)
+
+        if smc_state is not None and not smc_state.return_all:
+            type_logits = type_logits.index_select(0, smc_selected.to(type_logits.device))
+            type_hat = type_hat.index_select(0, smc_selected.to(type_hat.device))
+            pair_hat = pair_hat.index_select(0, smc_selected.to(pair_hat.device))
 
         return batch_X, batch_S, batch_ppls, {
             'type_logits': type_logits,

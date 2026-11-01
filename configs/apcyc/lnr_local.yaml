@@ -126,6 +126,24 @@ sample_opt:
   lambda_max: 0.0
   t_guidance_start: 0
   t_guidance_end: 0
+  smc:
+    enabled: false                # TODO: microbatching for unconditional generation
+    score: dist_energy            # alternatively: cycle, property with property_weights (list)
+    gpu_microbatch_size: 16
+    weight_scale: 5.0
+    cycle_weight: 1.0
+    resample_every: 4
+    resample_threshold: 0.5
+    rejuvenation_scale: 0 # maximum normalized-latent noise for DUPLICATED descendants; OFF by default
+    rejuvenation_decay_power: 1.0  # linear decay
+    rejuvenation_min_t: 9   # strictly zero at t <= 9 (last steps)
+    end_t: 1
+    stride: 1
+    selection: sample
+    nonfinite_policy: penalize
+    pair_fallback: unmasked
+    log_stats: false
+    output_subdir: smc
 
 pdb_root: CPSea/Model_Generation_and_Evaluation/TestSet/LNR/LNR_complex
 rec_chain: R
