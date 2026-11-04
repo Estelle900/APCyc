@@ -104,6 +104,8 @@ class EdgeFeatureInjector(nn.Module):
                 cycle_flag = torch.zeros_like(edge_batch, dtype=struct_feat.dtype)
                 for b in range(bs):
                     i, j = hard_pair[b].tolist()
+                    if i < 0 or j < 0 or i == j:
+                        continue  # No chemically valid pair at this timestep.
                     mask_ij = (row == i) & (col == j)
                     mask_ji = (row == j) & (col == i)
                     cycle_flag[mask_ij | mask_ji] = 1.0

@@ -31,6 +31,19 @@ def get_anchor_coords(
     return X[:, idx]
 
 
+def _apcyc_check_finite(label: str, value: torch.Tensor) -> None:
+    bad = ~torch.isfinite(value)
+    if bool(bad.any()):
+        indices = bad.nonzero(as_tuple=False)[:6].detach().cpu().tolist()
+        finite = value[~bad]
+        max_abs = float(finite.abs().max().item()) if finite.numel() else float('nan')
+        raise FloatingPointError(
+            f'{label} non-finite: shape={tuple(value.shape)}, '
+            f'bad_count={int(bad.sum().item())}, first={indices}, '
+            f'max_abs_of_finite={max_abs:.6g}'
+        )
+
+
 class OnlinePairInit(nn.Module):
     """
     Online pair feature constructor (no persistent pair state).
@@ -96,7 +109,10 @@ class OnlinePairInit(nn.Module):
         """
         device = node_feat.device
         N = node_feat.size(0)
-        phi = self.node_ln(self.node_proj(node_feat))  # [N, pair_dim]
+        _apcyc_check_finite('pair_init.node_feat', node_feat)
+        _apcyc_check_finite('pair_init.X', X)
+        phi = self.node_ln(self.node_proj(node_feat)) # [N, pair_dim]
+        _apcyc_check_finite('pair_init.projected_nodes', phi)
 
         phi_i = phi[:, None, :].expand(N, N, -1)
         phi_j = phi[None, :, :].expand(N, N, -1)
@@ -108,7 +124,14 @@ class OnlinePairInit(nn.Module):
             ca_idx=self.ca_idx,
             channel_idx=self.anchor_channel_idx,
         )
+        _apcyc_check_finite('pair_init.anchor', anchor)
         dist = torch.cdist(anchor, anchor, p=2)
+        if not bool(torch.isfinite(dist).all()):
+            # torch.cdist's fast matrix-multiplication path can suffer numeric
+            # overflow/cancellation even for finite coordinates. Recalculate
+            # only failed cases using float64. Never sanitize coordinates.
+            dist = torch.cdist(anchor.double(), anchor.double(), p=2).to(anchor.dtype)
+        _apcyc_check_finite('pair_init.distance', dist)
 
         if batch_ids is not None:
             same_batch = (batch_ids[:, None] == batch_ids[None, :]).to(dist.dtype)
@@ -127,7 +150,9 @@ class OnlinePairInit(nn.Module):
             feats.append(sep_emb)
 
         feat_ij = torch.cat(feats, dim=-1)
+        _apcyc_check_finite('pair_init.pair_features', feat_ij)
         pair_base = self.mlp(feat_ij)
+        _apcyc_check_finite('pair_init.mlp_output', pair_base)
         pair_struct = pair_base[..., : self.pair_struct_dim]
         pair_cyc = pair_base[..., self.pair_struct_dim :]
         return pair_base, pair_struct, pair_cyc, dist

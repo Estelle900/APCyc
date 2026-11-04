@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import pickle as pkl
+import math
 from tqdm import tqdm
 from copy import deepcopy
 from multiprocessing import Pool
@@ -53,13 +54,13 @@ def to_device(data, device):
 
 
 def clamp_coord(coord):
-    # some models (e.g. diffab) will output very large coordinates (absolute value >1000) which will corrupt the pdb file
-    new_coord = []
-    for val in coord:
-        if abs(val) >= 1000:
-            val = 0
-        new_coord.append(val)
-    return new_coord
+    """Reject invalid output instead of silently turning infinities into zeros."""
+    values = [float(val) for val in coord]
+    if len(values) != 3 or not all(math.isfinite(v) for v in values):
+        raise ValueError(f'Non-finite or malformed generated coordinates: {values}')
+    if any(abs(v) >= 1000 for v in values):
+        raise ValueError(f'Generated coordinate exceeds PDB safety bound: {values}')
+    return values
 
 
 def overwrite_blocks(blocks, seq=None, X=None):
@@ -156,6 +157,40 @@ def main(args, opt_args):
     print(f'Using checkpoint {b_ckpt}')
     model = torch.load(b_ckpt, map_location='cpu', weights_only=False)
     device = torch.device('cpu' if args.gpu == -1 else f'cuda:{args.gpu}')
+
+    degree_cfg = config.get('degree_scaled_mean', {})
+
+    if isinstance(model, models.APCycLDMPepDesign):
+        from setup_degree_reference import (
+            ensure_degree_reference,
+            disable_diffusion_degree_reference,
+        )
+
+        if degree_cfg is False or degree_cfg is None:
+            disable_diffusion_degree_reference(model)
+        else:
+            if degree_cfg is True:
+                degree_cfg = {}
+
+            if not isinstance(degree_cfg, dict):
+                raise TypeError(
+                    'degree_scaled_mean must be a mapping or false'
+                )
+
+            ensure_degree_reference(
+                model,
+                config_path=degree_cfg.get(
+                    'config',
+                    'configs/pepbench/ldm/setup_latent_guidance.yaml',
+                ),
+                cache_path=degree_cfg.get(
+                    'cache',
+                    'cache/apcyc_degree_reference.json',
+                ),
+                no_upscale=degree_cfg.get('no_upscale', False),
+                force=degree_cfg.get('force', False),
+            )
+    
     model.to(device)
     model.eval()
 
@@ -258,11 +293,16 @@ def parse():
 
     parser.add_argument('--gpu', type=int, default=0, help='GPU to use, -1 for cpu')
     parser.add_argument('--n_cpu', type=int, default=4, help='Number of CPU to use (for parallelly saving the generated results)')
+    parser.add_argument('--verbose', action="store_true", help="Print APCyc numerical diagnostics")
     return parser.parse_known_args()
 
 
 if __name__ == '__main__':
     args, opt_args = parse()
+    if args.verbose:
+        os.environ["APCYC_VERBOSE"] = "1"
+    else:
+        os.environ.pop("APCYC_VERBOSE", None)
     print_log(f'Overwritting args: {opt_args}')
     setup_seed(12)
     main(args, opt_args)

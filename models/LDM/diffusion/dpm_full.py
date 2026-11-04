@@ -94,6 +94,7 @@ class EpsilonNet(nn.Module):
             ctx_edge_attr=edge_attr,
             channel_attr=atom_embeddings,
             channel_weights=atom_weights,
+            x_update_mask=(atom_weights > 0),
             edge_bias=edge_bias,
             edge_gate=edge_gate,
         )

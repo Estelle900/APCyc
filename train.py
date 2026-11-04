@@ -21,7 +21,7 @@ import models
 from trainer import create_trainer
 from data import create_dataset, create_dataloader
 from utils.nn_utils import count_parameters
-
+from setup_degree_reference import configure_from_cache
 
 def parse():
     parser = argparse.ArgumentParser(description='training')
@@ -123,6 +123,38 @@ def main(args, opt_args):
         ckpt_path = config['load_ckpt']['path'] if isinstance(config['load_ckpt'], dict) else config['load_ckpt']
         print_log(f'Loading checkpoint: {ckpt_path}')
         model = load_ckpt(model, config['load_ckpt'])
+
+    degree_cfg = config.get('degree_scaled_mean', {})
+    if isinstance(model, models.APCycLDMPepDesign):
+        from setup_degree_reference import (
+            ensure_degree_reference,
+            disable_diffusion_degree_reference,
+        )
+
+        if degree_cfg is False or degree_cfg is None:
+            disable_diffusion_degree_reference(model)
+        else:
+            if degree_cfg is True:
+                degree_cfg = {}
+
+            if not isinstance(degree_cfg, dict):
+                raise TypeError(
+                    'degree_scaled_mean must be a mapping or false'
+                )
+
+            ensure_degree_reference(
+                model,
+                config_path=degree_cfg.get(
+                    'config',
+                    'configs/pepbench/ldm/setup_latent_guidance.yaml',
+                ),
+                cache_path=degree_cfg.get(
+                    'cache',
+                    'cache/apcyc_degree_reference.json',
+                ),
+                no_upscale=degree_cfg.get('no_upscale', False),
+                force=degree_cfg.get('force', False),
+            )
 
     ########### load your train / valid set ###########
     train_set, valid_set, _ = create_dataset(config['dataset'])

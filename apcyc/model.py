@@ -1,5 +1,6 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
+import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -15,6 +16,7 @@ from apcyc.smc import select_samples, SMCController, expand_graph_batch
 from apcyc.diffusion.apcyc_dpm import APCycFullDPM
 from apcyc.constants import CYCLE_TYPES, TYPE2IDX
 
+APCYC_VERBOSE = os.environ.get("APCYC_VERBOSE", "0") == "1"
 
 def _strip_prefix(state_dict, prefix):
     return {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
@@ -36,6 +38,19 @@ def _load_autoencoder(ckpt_path: str, strict: bool) -> AutoEncoder:
         return autoencoder
     raise TypeError(f'Unsupported autoencoder checkpoint type: {type(ckpt)}')
 
+def report_tensor(name, x):
+    x = x.detach()
+    finite = torch.isfinite(x)
+    max_abs = (
+        x[finite].abs().max().item()
+        if finite.any() else float("nan")
+    )
+    print(
+        f"[APCyc] {name}: "
+        f"finite={finite.all().item()}, "
+        f"max_abs={max_abs:.6g}",
+        flush=True,
+    )
 
 @R.register('APCycLDMPepDesign')
 class APCycLDMPepDesign(nn.Module):
@@ -503,6 +518,10 @@ class APCycLDMPepDesign(nn.Module):
         
         X_0, H_0 = traj[0]
         X_0, H_0 = X_0[mask][:, : self.autoencoder.latent_n_channel], H_0[mask]
+
+        if APCYC_VERBOSE:
+            report_tensor("latent X before decoder", X_0)
+            report_tensor("latent H before decoder", H_0)
 
         batch_X, batch_S, batch_ppls = self.autoencoder.test(
             X, S, mask, position_ids, lengths, atom_mask,

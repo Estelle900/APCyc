@@ -85,7 +85,13 @@ python setup_latent_guidance.py --config ${LATENT_DIST_CONFIG} --ckpt ${LDM_CKPT
 ########## generate ##########
 echo "Generate results Using LDM checkpoint: ${LDM_CKPT}" >> $OUTLOG
 if [ "$GENERATE_FLAG" = "1" ]; then
-    python generate.py --config $TEST_CONFIG --ckpt $LDM_CKPT --gpu ${GPU:0:1}
+    APCYC_EGNN_MAX_EDGE_NORM=100 \
+    APCYC_EGNN_MAX_NODE_UPDATE_NORM=250 \
+    APCYC_EGNN_MAX_GEOM_DISTANCE=50 \
+    APCYC_EGNN_MAX_COORD_GAIN=100 \
+    APCYC_MAX_H_UPDATE=20 \
+    APCYC_EGNN_MAX_COORD_STEP=50 \
+    python generate.py --config $TEST_CONFIG --ckpt $LDM_CKPT --gpu ${GPU:0:1} --verbose
 fi
 
 ########## cal metrics ##########
@@ -95,5 +101,5 @@ if [ "$EVAL_FLAG" = "1" ]; then
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
-    python cal_metrics.py --results ${LDM_SAVE_DIR}/version_0/results/results.jsonl >> $OUTLOG
+    python cal_metrics.py --results ${LDM_SAVE_DIR}/version_0/results/smc/results.jsonl >> $OUTLOG
 fi

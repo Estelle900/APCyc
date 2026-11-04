@@ -112,7 +112,9 @@ class GlobalWeights:
             if self.nonfinite_policy == 'raise':
                 raise ValueError(f'Global SMC t={t}: {count_bad} non-finite particle scores')
             if not self.warned_nonfinite:
+                invalid_ids = (~valid).nonzero(as_tuple=False).flatten()[:10].tolist()
                 warnings.warn(f'Global SMC t={t}: {count_bad} non-finite score(s); '
+                              f'global_particle_ids_first10={invalid_ids}; '
                               'penalizing invalid particles', RuntimeWarning, stacklevel=2)
                 self.warned_nonfinite = True
         if bool(valid.any()):
@@ -299,10 +301,16 @@ def _sample_one(model, group, sample_opt, *, particles, microbatch_size,
                 'observer': observer, 'initial_state': initial,
                 'start_t': top, 'stop_t': bottom,
             }
-            output = model.sample(*batch[:6], L=batch[6], sample_opt=seg_opt,
-                                  return_pair=return_pair if is_final else False,
-                                  return_tensor=return_tensor,
-                                  optimize_sidechain=optimize_sidechain)
+            try:
+                output = model.sample(*batch[:6], L=batch[6], sample_opt=seg_opt,
+                                      return_pair=return_pair if is_final else False,
+                                      return_tensor=return_tensor,
+                                      optimize_sidechain=optimize_sidechain)
+            except FloatingPointError as exc:
+                raise FloatingPointError(
+                    f'Global SMC window {top}->{bottom}, global particle range '
+                    f'[{first}, {first + count}) failed: {exc}'
+                ) from exc
             if has_score:
                 if not hasattr(observer, 'last_scores'):
                     raise RuntimeError(f'SMC score not observed at t={bottom}')

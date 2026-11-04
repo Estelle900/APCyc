@@ -1,7 +1,7 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
 import math
-
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,6 +21,7 @@ from .backbone.api import BackboneModel
 from ..dyMEAN.modules.am_egnn import AMEGNN # adaptive-multichannel egnn
 from ..dyMEAN.nn_utils import SeparatedAminoAcidFeature, ProteinFeature
 
+APCYC_VERBOSE = os.environ.get("APCYC_VERBOSE", "0") == "1"
 
 def create_encoder(
     name,
@@ -486,7 +487,13 @@ class AutoEncoder(nn.Module):
             atom_mask[mask] = 1
         else:  # fixseq mode does not need to change atom mask
             pass
-
+        if APCYC_VERBOSE:
+            print(
+                "[APCyc decoder input]",
+                X[mask].abs().max().item(),
+                flush=True,
+            )
+        
         ctx_edges, inter_edges, batch_ids = self.prepare_inputs(X, S, mask, atom_mask, lengths)
         edges = torch.cat([ctx_edges, inter_edges], dim=1)
 
@@ -515,6 +522,13 @@ class AutoEncoder(nn.Module):
             atom_mask = atom_mask.clone()
             atom_mask[mask] = atom_weights.bool()[mask] & atom_mask[mask] # reset atomic visibility of the reconstruction part with the decoded sequence
             _, pred_X = self.sidechain_decoder(H_0, X, edges, channel_attr=atom_embeddings, channel_weights=atom_mask.float())
+            if APCYC_VERBOSE:
+                print(
+                    "[APCyc decoder output]",
+                    "finite=", torch.isfinite(pred_X[mask]).all().item(),
+                    "max_abs=", pred_X[mask].abs().max().item(),
+                    flush=True,
+                )
             pred_X = pred_X[mask]
         else:
             pred_X = None

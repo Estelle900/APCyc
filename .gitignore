@@ -75,6 +75,7 @@ output/
 outputs/
 results/
 result/
+cache/
 eval_output/
 eval_outputs/
 wandb/

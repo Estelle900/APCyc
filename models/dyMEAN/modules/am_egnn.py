@@ -1,5 +1,6 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
+import os
 import torch
 import torch.nn as nn
 
@@ -7,6 +8,40 @@ from utils.decorators import singleton
 
 from .radial_basis import RadialBasis
 
+max_step = float(os.environ.get('APCYC_EGNN_MAX_COORD_STEP', '0'))
+
+def _apcyc_egnn_limit(name, value, smooth=False):
+    limit = float(os.environ.get(name, "0"))
+    if limit <= 0:
+        return value
+
+    if not torch.isfinite(value).all():
+        raise FloatingPointError(
+            f"EGNN non-finite tensor before {name}"
+        )
+    
+    magnitude = torch.linalg.vector_norm(value, dim=-1, keepdim=True)
+
+    if smooth:
+        # Smooth radial saturation preserving rotational equivariance:
+        # f(v) = v / sqrt(1 + (||v|| / limit)^2)
+        scale = torch.rsqrt(
+            1.0 + (magnitude / limit).square()
+        )
+    else:
+        scale = (limit / magnitude.clamp_min(1e-12)).clamp(max=1.0)
+
+    clipped = magnitude > limit
+
+    if clipped.any():
+        print(
+            f"[EGNN MSG] {name}: "
+            f"over_limit={clipped.sum().item()} "
+            f"max_before={magnitude.max().item():.5g}",
+            flush=True,
+        )
+
+    return (value * scale).to(value.dtype)
 
 class RadialLinear(nn.Module):
     def __init__(self, n_rbf, cutoff):
@@ -123,8 +158,22 @@ class RollerPooling(nn.Module):
         :param hidden: [n_edges, n_channel]
         :param target_size: [n_edges]
         '''
-        pool_mat = self.pool_matrix.to(hidden.device).type(hidden.dtype)
-        pool_mat = pool_mat[target_size - 1]  # [n_edges, n_channel, n_channel]
+        if torch.any((target_size < 0) | (target_size > self.n_channel)):
+            raise ValueError(
+                'RollerPooling: target_size outside [0, n_channel]'
+            )
+
+        pool_mat = self.pool_matrix.to(
+            device=hidden.device,
+            dtype=hidden.dtype
+        )
+
+        pool_mat = pool_mat[target_size.clamp(min=1) - 1]
+
+        # Empty rows have zero pooling mass, never an accidental last-window pool.
+        pool_mat = pool_mat * (
+            target_size > 0
+        ).to(hidden.dtype)[:, None, None]
         hidden = hidden.unsqueeze(-1)  # [n_edges, n_channel, 1]
         return torch.bmm(pool_mat, hidden)  # [n_edges, n_channel, 1]
 
@@ -200,13 +249,19 @@ class AM_E_GCL(nn.Module):
         if self.attention:
             att_val = self.att_mlp(out)
             out = out * att_val
+
         if edge_bias is not None:
             out = out + edge_bias
+
         if edge_gate is not None:
             out = out * edge_gate
+
+        # Limit the complete edge message after attention, bias and gating.
+        out = _apcyc_egnn_limit("APCYC_EGNN_MAX_EDGE_NORM", out)
+
         return out
 
-    def node_model(self, x, edge_index, edge_attr, node_attr):
+    def node_model(self, x, edge_index, edge_attr, node_attr, edge_valid=None):
         '''
         :param x: [bs * n_node, input_size]
         :param edge_index: list of [n_edge], [n_edge]
@@ -215,6 +270,23 @@ class AM_E_GCL(nn.Module):
         '''
         row, col = edge_index
         agg = unsorted_segment_sum(edge_attr, row, num_segments=x.size(0))  # [bs * n_node, hidden_size]
+        ref = getattr(self, "_apcyc_degree_reference", None)
+        if ref is not None:
+            if edge_valid is None:
+                # Intended as compatibility for callers with no channel masks.
+                degree = torch.bincount(row, minlength=x.size(0)).to(
+                    device=agg.device, dtype=agg.dtype
+                )[:, None]
+            else:
+                degree = unsorted_segment_sum(
+                    edge_valid.to(dtype=agg.dtype).unsqueeze(-1),
+                    row, num_segments=x.size(0),
+                )
+            scale = ref.to(device=agg.device, dtype=agg.dtype) / degree.clamp_min(1)
+            if getattr(self, "_apcyc_degree_no_upscale", False):
+                # Optional conservative variant: never boost original sums.
+                scale = scale.clamp(max=1)
+            agg = agg * scale
         # print_log(f'agg1, {torch.isnan(agg).sum()}', level='DEBUG')
         if node_attr is not None:
             agg = torch.cat([x, agg, node_attr], dim=1)
@@ -224,6 +296,7 @@ class AM_E_GCL(nn.Module):
         out = self.node_mlp(agg)  # [bs * n_node, output_size]
         # print_log(f'out, {torch.isnan(out).sum()}', level='DEBUG')
         out = self.dropout(out)
+        out = _apcyc_egnn_limit("APCYC_EGNN_MAX_NODE_UPDATE_NORM", out)
         if self.residual:
             out = x + out
         return out, agg
@@ -242,10 +315,19 @@ class AM_E_GCL(nn.Module):
 
         # first pooling, then element-wise multiply
         n_channel = channel_weights.shape[-1]
-        edge_feat = self.coord_mlp(edge_feat)  # [n_edge, n_channel]
-        channel_sum = (channel_weights != 0).long().sum(-1)  # [N]
-        pooled_edge_feat = RollerPooling(n_channel)(edge_feat, channel_sum[row])  # [n_edge, n_channel, 1]
-        trans = coord_diff * pooled_edge_feat  # [n_edge, n_channel, d]
+        edge_feat = self.coord_mlp(edge_feat)
+        channel_sum = (channel_weights != 0).long().sum(-1)
+        pooled_edge_feat = RollerPooling(n_channel)(edge_feat, channel_sum[row])
+
+        # Bound geometric differences and coordinate scaling coefficients before multiplication.
+        coord_diff = _apcyc_egnn_limit("APCYC_EGNN_MAX_GEOM_DISTANCE", coord_diff, smooth=True)
+        pooled_edge_feat = _apcyc_egnn_limit("APCYC_EGNN_MAX_COORD_GAIN", pooled_edge_feat, smooth=True)
+        trans = coord_diff * pooled_edge_feat
+
+        # Never update a channel with zero atom weight, discard missing-node edges.
+        valid = (channel_weights[row] > 0) & (channel_sum[col] > 0)[:, None]
+
+        trans = torch.where(valid[..., None], trans, torch.zeros_like(trans))
 
         # aggregate
         if self.coords_agg == 'sum':
@@ -254,11 +336,29 @@ class AM_E_GCL(nn.Module):
             agg = unsorted_segment_mean(trans, row, num_segments=coord.size(0))  # [N, n_channel, d]
         else:
             raise Exception('Wrong coords_agg parameter' % self.coords_agg)
+        if max_step > 0:
+            # Bound each atom's aggregate displacement before casting back to fp32.
+            magnitude = torch.linalg.vector_norm(agg, dim=-1, keepdim=True)
+            scale = (max_step / magnitude.clamp(min=1e-12)).clamp(max=1.0)
+            agg = (agg*scale).to(coord.dtype)
+            valid = channel_weights > 0
+            clipped = (magnitude.squeeze(-1) > max_step) & valid
+
+            if clipped.any():
+                print(
+                    "[EGNN CLIP]",
+                    f"max_norm={magnitude.squeeze(-1)[valid].max().item():.2f}",
+                    f"clipped={clipped.sum().item()}",
+                    f"active={valid.sum().item()}",
+                    flush=True,
+                )
+
         if x_update_mask is None:
-            coord = coord + agg
+            x_update_mask = channel_weights > 0
         else:
-            x_update_mask = x_update_mask.unsqueeze(-1).float()  # [N, n_channel, 1]
-            coord = coord + x_update_mask * agg
+            x_update_mask = (x_update_mask.bool() & (channel_weights > 0))
+
+        coord = coord + torch.where(x_update_mask.unsqueeze(-1), agg, torch.zeros_like(agg))
         return coord
 
     def forward(self, h, edge_index, coord, channel_attr, channel_weights,
@@ -276,8 +376,13 @@ class AM_E_GCL(nn.Module):
         radial, coord_diff = coord2radial(edge_index, coord, channel_attr, channel_weights, self.radial_linear, getattr(self, 'rbf_linear', None))
 
         edge_feat = self.edge_model(h[row], h[col], radial, edge_attr, edge_bias=edge_bias, edge_gate=edge_gate)  # [n_edge, hidden_size]
+        
+        # An edge is present only when both nodes have at least one active coordinate channel.
+        edge_present = (channel_weights[row] > 0).any(dim=-1) & (channel_weights[col] > 0).any(dim=-1)
+        edge_feat = torch.where(edge_present[:, None], edge_feat, torch.zeros_like(edge_feat))
+        
         coord = self.coord_model(coord, edge_index, coord_diff, edge_feat, channel_attr, channel_weights, x_update_mask)    # [bs * n_node, n_channel, d]
-        h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
+        h, agg = self.node_model(h, edge_index, edge_feat, node_attr, edge_valid=edge_present)
 
         return h, coord
 
@@ -341,9 +446,21 @@ def coord2radial(edge_index, coord, attr, channel_weights, linear_map, rbf_linea
             break
         seg_row, seg_col = row[start:end], col[start:end]
 
-        coord_msg = torch.norm(
-            coord[seg_row].unsqueeze(2) - coord[seg_col].unsqueeze(1),  # [n_edge, n_channel, n_channel, d]
-            dim=-1, keepdim=False)  # [n_edge, n_channel, n_channel]
+        # Calculate distances only for physically present channels.
+        row_valid = channel_weights[seg_row] > 0
+        col_valid = channel_weights[seg_col] > 0
+        pair_valid = row_valid[:, :, None] & col_valid[:, None, :]
+
+        delta = (coord[seg_row].unsqueeze(2) - coord[seg_col].unsqueeze(1))
+
+        # Mask BEFORE computing norms, not afterward.
+        delta = torch.where(
+            pair_valid[..., None],
+            delta,
+            torch.zeros_like(delta),
+        )
+
+        coord_msg = torch.linalg.vector_norm(delta, dim=-1).to(coord.dtype)
         if rbf_linear:
             coord_msg = rbf_linear(coord_msg)
         
@@ -372,7 +489,15 @@ def coord2radial(edge_index, coord, attr, channel_weights, linear_map, rbf_linea
     channel_mask = (channel_weights != 0).long()  # [N, n_channel]
     channel_sum = channel_mask.sum(-1)  # [N]
     pooled_col_coord = (coord[col] * channel_mask[col].unsqueeze(-1)).sum(1)  # [n_edge, d]
-    pooled_col_coord = pooled_col_coord / channel_sum[col].unsqueeze(-1)  # [n_edge, d], denominator cannot be 0 since no pad node exists
-    coord_diff = coord[row] - pooled_col_coord.unsqueeze(1)  # [n_edge, n_channel, d]
+    pooled_col_coord = pooled_col_coord / channel_sum[col].clamp(min=1).unsqueeze(-1) # [n_edge, d], denominator cannot be 0 since no pad node exists
+    coord_diff = coord[row] - pooled_col_coord.unsqueeze(1)
+
+    valid_coord_message = (channel_weights[row] > 0) & (channel_sum[col] > 0)[:, None]
+
+    coord_diff = torch.where(
+        valid_coord_message[..., None],
+        coord_diff,
+        torch.zeros_like(coord_diff),
+    )
 
     return radials, coord_diff

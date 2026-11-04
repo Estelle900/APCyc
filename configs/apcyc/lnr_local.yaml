@@ -127,9 +127,9 @@ sample_opt:
   t_guidance_start: 0
   t_guidance_end: 0
   smc:
-    enabled: false                # TODO: microbatching for unconditional generation
+    enabled: true                # TODO: microbatching for unconditional generation
     score: dist_energy            # alternatively: cycle, property with property_weights (list)
-    gpu_microbatch_size: 16
+    gpu_microbatch_size: 13
     weight_scale: 5.0
     cycle_weight: 1.0
     resample_every: 4
@@ -144,6 +144,11 @@ sample_opt:
     pair_fallback: unmasked
     log_stats: false
     output_subdir: smc
+degree_scaled_mean:
+  config: configs/pepbench/ldm/setup_latent_guidance.yaml
+  cache: cache/apcyc_degree_reference.json
+  no_upscale: true
+  force: false
 
 pdb_root: CPSea/Model_Generation_and_Evaluation/TestSet/LNR/LNR_complex
 rec_chain: R

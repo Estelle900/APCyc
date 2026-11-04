@@ -38,9 +38,9 @@ trainer:
   config:
     max_epoch: 1000
     save_topk: 5
-    val_freq: 5
+    val_freq: 1
     save_dir: ./ckpts/APCyc
-    patience: 5
+    patience: 20
     metric_min_better: true
     optimizer:
       class: AdamW
@@ -48,7 +48,7 @@ trainer:
     scheduler:
       class: ReduceLROnPlateau
       factor: 0.6
-      patience: 3
+      patience: 5
       mode: min
       frequency: val_epoch
       min_lr: 5.0e-6
@@ -128,6 +128,11 @@ sample_opt:
   lambda_max: 0.0
   t_guidance_start: 0
   t_guidance_end: 0
+degree_scaled_mean:
+  config: configs/pepbench/ldm/setup_latent_guidance.yaml
+  cache: cache/apcyc_degree_reference.json
+  no_upscale: true
+  force: false
 
 pdb_root: CPCore/CPCore_pdb
 rec_chain: R

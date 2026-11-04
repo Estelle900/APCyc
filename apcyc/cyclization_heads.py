@@ -144,52 +144,66 @@ class CyclizationHeads(nn.Module):
         L = pair_cyc.size(0)
         symbols = _pep_symbols(S_pep)
 
+        if not bool(torch.isfinite(pair_cyc).all()):
+            raise FloatingPointError('CyclizationHeads: pair_cyc input is non-finite')
         pooled = pair_cyc.mean(dim=(0, 1))
+        if not bool(torch.isfinite(pooled).all()):
+            raise FloatingPointError('CyclizationHeads: pooled pair_cyc is non-finite')
         if type_logits is None:
             type_logits = self.type_mlp(pooled)
         pair_logits = self.pair_mlp(pair_cyc).squeeze(-1)
 
-        upper_mask = _upper_triangle_mask(L, device)
+        # A non-finite model output is a real failure, not a missing valid pair.
+        # In particular, never turn NaN logits into an arbitrary proposed bond.
+        if not bool(torch.isfinite(type_logits).all()) or not bool(torch.isfinite(pair_logits).all()):
+            bad_params = [
+                name for name, p in self.type_mlp.named_parameters()
+                if not bool(torch.isfinite(p).all())
+            ]
+            max_input = float(pooled.abs().max().item()) if pooled.numel() else 0.0
+            raise FloatingPointError(
+                'CyclizationHeads: non-finite type logits despite finite pair features; '
+                f'pooled_abs_max={max_input:.6g}, nonfinite_type_mlp_params={bad_params}'
+            )
 
+        upper_mask = _upper_triangle_mask(L, device)
         if self.mask_mode == 'teacher':
-            if type_label is None:
-                pred_idx = int(torch.argmax(type_logits).item())
-                valid_mask = self._valid_mask_by_type(symbols, pred_idx, device)
-            else:
-                valid_mask = self._valid_mask_by_type(symbols, type_label, device)
+            idx = int(torch.argmax(type_logits).item()) if type_label is None else type_label
+            valid_mask = self._valid_mask_by_type(symbols, idx, device)
         elif self.mask_mode == 'predicted':
-            pred_idx = int(torch.argmax(type_logits).item())
-            valid_mask = self._valid_mask_by_type(symbols, pred_idx, device)
+            idx = int(torch.argmax(type_logits).item())
+            valid_mask = self._valid_mask_by_type(symbols, idx, device)
         elif self.mask_mode == 'mixture':
-            probs = torch.softmax(type_logits, dim=-1)
-            valid_mask = torch.zeros((L, L), device=device, dtype=pair_logits.dtype)
+            probs = torch.softmax(type_logits.float(), dim=-1)
+            valid_mask = torch.zeros((L, L), device=device, dtype=torch.float32)
             for t_idx in range(len(CYCLE_TYPES)):
                 mask_t = self._valid_mask_by_type(symbols, t_idx, device).float()
                 valid_mask = valid_mask + probs[t_idx] * mask_t
         elif self.mask_mode in ('none', 'no_type', 'unconditional'):
-            # Do not condition on cyclization type; allow all peptide pairs.
             valid_mask = upper_mask
         else:
             raise ValueError(f'Unknown mask_mode {self.mask_mode}')
 
-        if self.min_sep_all > 1:
-            sep_mask = torch.triu(
-                torch.ones((L, L), device=device, dtype=torch.bool),
-                diagonal=self.min_sep_all,
-            )
-            if valid_mask.dtype == torch.bool:
-                valid_mask = valid_mask & sep_mask
-            else:
-                valid_mask = valid_mask * sep_mask.float()
-
+        sep_mask = torch.triu(torch.ones((L, L), device=device, dtype=torch.bool),
+                              diagonal=max(1, self.min_sep_all))
         if valid_mask.dtype == torch.bool:
-            valid_mask = valid_mask & upper_mask
-            logits_masked = pair_logits.masked_fill(~valid_mask, float('-inf'))
+            allowed = valid_mask & upper_mask & sep_mask
+            weights = allowed.float()
         else:
-            valid_mask = valid_mask * upper_mask.float()
-            logits_masked = pair_logits + torch.log(valid_mask + self.eps)
+            weights = valid_mask.float() * (upper_mask & sep_mask).float()
+            allowed = weights > 0
+        if not bool(allowed.any()):
+            # Strict constraints may make closure impossible (or L < 2).
+            # No closure is represented by zero probability, not NaNs or an
+            # chemically invalid fallback. Hard-pair selection handles this.
+            return type_logits, pair_logits, torch.zeros_like(pair_logits)
 
-        s_ij = torch.softmax(logits_masked.view(-1), dim=0).view(L, L)
+        # Float32 softmax avoids fp16 overflow; invalid entries have exactly
+        # zero mass even in mixture mode (no log(eps) mass on invalid bonds).
+        logits = pair_logits.float() + torch.log(weights.clamp_min(self.eps))
+        logits = logits.masked_fill(~allowed, float('-inf'))
+        probs = torch.softmax(logits.reshape(-1), dim=0).reshape(L, L)
+        s_ij = probs.to(dtype=pair_logits.dtype)
         return type_logits, pair_logits, s_ij
 
     def forward(
